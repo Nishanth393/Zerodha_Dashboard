@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from kiteconnect import KiteConnect
+import matplotlib
 import datetime
 import re
 import time
