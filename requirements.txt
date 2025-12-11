@@ -3,3 +3,4 @@ pandas>=2.0.0
 plotly>=5.0.0
 kiteconnect>=4.0.0
 requests>=2.28.0
+matplotlib>=3.10.7
