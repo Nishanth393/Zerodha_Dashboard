@@ -3,7 +3,6 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from kiteconnect import KiteConnect
-import matplotlib
 import datetime
 import re
 import time
@@ -21,7 +20,8 @@ st.markdown("""
         .stDataFrame { width: 100% !important; }
         [data-testid="stMetricValue"] { font-size: 1.1rem !important; }
         .stButton button { min-height: 45px; width: 100%; }
-        
+        /* Reduce gap between charts */
+        .element-container { margin-bottom: 1rem !important; }
         /* Pulse Animation for Live Status */
         @keyframes pulse {
             0% { opacity: 1; }
@@ -39,7 +39,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. AUTHENTICATION ---
+# --- 2. SIDEBAR: AUTHENTICATION ---
 st.sidebar.title("🪁 Setup")
 
 def sanitize_key(key):
@@ -76,7 +76,7 @@ app_mode = st.sidebar.radio(
     ["Portfolio Manager", "Tradebook Analyzer", "Technical Scanner", "Market Heatmap"]
 )
 
-# --- 3. HELPERS ---
+# --- 3. SHARED HELPER FUNCTIONS ---
 @st.cache_data(ttl=3600*4) 
 def get_instruments():
     if kite: return pd.DataFrame(kite.instruments("NFO"))
@@ -92,19 +92,28 @@ def calculate_tax_for_position(row):
     price = row['last_price']
     turnover = qty * price
     brokerage = 20.0
+    
     is_fno = row['exchange'] == 'NFO'
     is_option = is_fno and (row['tradingsymbol'].endswith('CE') or row['tradingsymbol'].endswith('PE'))
     is_future = is_fno and not is_option
-    stt = turnover * 0.000625 if is_option else (turnover * 0.000125 if is_future else turnover * 0.001)
-    txn = turnover * 0.00053 if is_option else (turnover * 0.00002 if is_future else turnover * 0.0000345)
+    
+    stt, txn = 0.0, 0.0
+    if is_option:
+        stt = turnover * 0.000625 
+        txn = turnover * 0.00053
+    elif is_future:
+        stt = turnover * 0.000125
+        txn = turnover * 0.00002
+    else: # Equity
+        stt = turnover * 0.001
+        txn = turnover * 0.0000345
+        
     gst = (brokerage + txn) * 0.18
     return brokerage + stt + txn + gst
 
-# --- 4. MODULE: PORTFOLIO MANAGER (AUTO-REFRESH ENABLED) ---
-# The @st.fragment decorator makes ONLY this function re-run every 2 seconds
+# --- 4. MODULE: PORTFOLIO MANAGER (AUTO-REFRESH) ---
 @st.fragment(run_every=2)
 def render_portfolio_live():
-    # Fetch Data
     try:
         margins = kite.margins()
         cash = margins['equity']['available']['live_balance']
@@ -119,8 +128,7 @@ def render_portfolio_live():
             df['Net P&L'] = df['pnl'] - df['Est. Tax']
             total_pnl = df['Net P&L'].sum()
         
-        # Header Metrics
-        st.markdown('<div><span class="live-dot"></span> <b>LIVE UPDATES (2s)</b></div>', unsafe_allow_html=True)
+        st.markdown('<div><span class="live-dot"></span> <b>LIVE</b></div>', unsafe_allow_html=True)
         c1, c2, c3 = st.columns(3)
         c1.metric("💰 Available", f"₹{cash:,.0f}")
         c2.metric("📉 Used", f"₹{used:,.0f}")
@@ -147,81 +155,116 @@ def render_portfolio_live():
 def render_portfolio():
     st.title("💼 Live Portfolio")
     if not kite: st.warning("⚠️ Connect to Zerodha first."); return
-    # Call the auto-refreshing fragment
     render_portfolio_live()
 
-# --- 5. MODULE: TECHNICAL SCANNER ---
+# --- 5. MODULE: TECHNICAL SCANNER (GAP-FREE + MULTI-CHART) ---
 def render_scanner():
     st.title("📈 Technical Scanner (Pro)")
     if not kite: st.warning("⚠️ Connect to Zerodha first."); return
     
+    # Inputs
     c1, c2, c3, c4 = st.columns([1.5, 1, 1, 1])
     with c1: sym = st.text_input("Symbol", "ASHOKLEY", key="scan_sym").upper()
-    with c2: days = st.number_input("Lookback Days", 1, 1000, 5)
+    with c2: days = st.number_input("Days", 1, 1000, 5)
     with c3:
         imap = {"Default": None, "1 Min": "minute", "60 Min": "60minute", "Daily": "day"}
         sel_int = st.selectbox("Interval", list(imap.keys()))
     with c4: 
         st.write("") 
-        run = st.button("Load Chart", type="primary")
+        run = st.button("Load Charts", type="primary")
         
     if run:
         try:
-            with st.spinner("Fetching..."):
-                inst = pd.DataFrame(kite.instruments("NSE"))
-                tok_row = inst[inst['tradingsymbol'] == sym]
-                if tok_row.empty:
-                    inst_nfo = pd.DataFrame(kite.instruments("NFO"))
-                    tok_row = inst_nfo[inst_nfo['tradingsymbol'] == sym]
-                if tok_row.empty: st.error("Symbol not found"); return
-                tok = tok_row.iloc[0]['instrument_token']
+            with st.spinner("Fetching Spot & Futures..."):
+                # 1. IDENTIFY TOKENS
+                tokens_to_plot = []
                 
-                manual = imap[sel_int]
-                interval = manual if manual else ("minute" if days <= 3 else ("60minute" if days <= 60 else "day"))
+                # A. Spot
+                inst_eq = pd.DataFrame(kite.instruments("NSE"))
+                spot_row = inst_eq[inst_eq['tradingsymbol'] == sym]
+                if spot_row.empty:
+                    eq_sym = get_correct_equity_symbol(sym).replace("NSE:", "")
+                    spot_row = inst_eq[inst_eq['tradingsymbol'] == eq_sym]
                 
-                buffer = days + 4 + (days // 5) * 2 
-                to_date = datetime.datetime.now()
-                from_date = to_date - datetime.timedelta(days=buffer)
-                from_date = from_date.replace(hour=0, minute=0, second=0) 
+                if not spot_row.empty:
+                    tokens_to_plot.append({"label": f"SPOT: {sym}", "token": spot_row.iloc[0]['instrument_token']})
                 
-                recs = kite.historical_data(tok, from_date, to_date, interval)
-                df = pd.DataFrame(recs)
-                if df.empty: st.warning("No data."); return
+                # B. Futures
+                inst_nfo = pd.DataFrame(kite.instruments("NFO"))
+                futs = inst_nfo[(inst_nfo['name'] == sym) & (inst_nfo['instrument_type'] == 'FUT')].copy()
                 
-                if interval == "day": df = df.tail(days)
-                
-                for s in [10, 20, 50, 100]: df[f'EMA_{s}'] = df['close'].ewm(span=s).mean()
-                df['VWAP'] = (df['close']*df['volume']).cumsum() / df['volume'].cumsum()
-                
-                lc = df.iloc[-2] if len(df)>1 else df.iloc[-1]
-                p = (lc['high']+lc['low']+lc['close'])/3
-                r = lc['high']-lc['low']
-                
-                fig = go.Figure()
-                fig.add_trace(go.Candlestick(x=df['date'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name="Price"))
-                
-                colors = {10:'cyan', 20:'magenta', 50:'orange', 100:'white'}
-                for s, c in colors.items():
-                    fig.add_trace(go.Scatter(x=df['date'], y=df[f'EMA_{s}'], line=dict(color=c, width=1), name=f"EMA {s}"))
-                fig.add_trace(go.Scatter(x=df['date'], y=df['VWAP'], line=dict(color='purple', width=2, dash='dot'), name="VWAP"))
-                
-                def add_line(val, name, col):
-                    fig.add_shape(type="line", x0=df['date'].iloc[0], x1=df['date'].iloc[-1], y0=val, y1=val, line=dict(color=col, width=1, dash="dash"))
-                
-                pivots = [
-                    (p, "P", "yellow"), (p+0.382*r, "R1", "green"), (p+0.618*r, "R2", "green"), (p+r, "R3", "lightgreen"),
-                    (p-0.382*r, "S1", "red"), (p-0.618*r, "S2", "red"), (p-r, "S3", "darkred")
-                ]
-                for val, name, col in pivots: add_line(val, name, col)
+                if not futs.empty:
+                    futs['expiry'] = pd.to_datetime(futs['expiry'])
+                    futs = futs.sort_values('expiry')
+                    if len(futs) >= 1: tokens_to_plot.append({"label": f"NEAR FUT: {futs.iloc[0]['tradingsymbol']}", "token": futs.iloc[0]['instrument_token']})
+                    if len(futs) >= 2: tokens_to_plot.append({"label": f"NEXT FUT: {futs.iloc[1]['tradingsymbol']}", "token": futs.iloc[1]['instrument_token']})
 
-                fig.update_layout(height=600, margin=dict(l=10, r=10, t=30, b=10), template="plotly_dark", legend=dict(orientation="h", y=1.02), xaxis_rangeslider_visible=False)
-                st.plotly_chart(fig, use_container_width=True)
-                
-                st.markdown("### 🔢 Levels")
-                cols = st.columns(7)
-                cols[0].metric("Pivot", f"{p:.2f}")
-                cols[1].metric("R1", f"{p+0.382*r:.2f}"); cols[2].metric("R2", f"{p+0.618*r:.2f}"); cols[3].metric("R3", f"{p+r:.2f}")
-                cols[4].metric("S1", f"{p-0.382*r:.2f}"); cols[5].metric("S2", f"{p-0.618*r:.2f}"); cols[6].metric("S3", f"{p-r:.2f}")
+                if not tokens_to_plot: st.error("No instruments found."); return
+
+                # 2. CHART GENERATOR (GAP-FREE LOGIC)
+                def generate_chart(item):
+                    st.markdown(f"### {item['label']}")
+                    tok = item['token']
+                    
+                    manual = imap[sel_int]
+                    interval = manual if manual else ("minute" if days <= 3 else ("60minute" if days <= 60 else "day"))
+                    
+                    # Buffer for weekends
+                    buffer = days + 4 + (days // 5) * 2
+                    from_d = (datetime.datetime.now() - datetime.timedelta(days=buffer)).replace(hour=0, minute=0, second=0)
+                    
+                    recs = kite.historical_data(tok, from_d, datetime.datetime.now(), interval)
+                    df = pd.DataFrame(recs)
+                    if df.empty: st.warning("No Data"); return
+                    
+                    if interval == "day": df = df.tail(days)
+                    
+                    # Indicators
+                    for s in [10, 20, 50, 100]: df[f'EMA_{s}'] = df['close'].ewm(span=s).mean()
+                    df['VWAP'] = (df['close']*df['volume']).cumsum() / df['volume'].cumsum()
+                    
+                    lc = df.iloc[-2] if len(df)>1 else df.iloc[-1]
+                    p = (lc['high']+lc['low']+lc['close'])/3
+                    r = lc['high']-lc['low']
+                    
+                    # --- GAP REMOVAL: STRING DATE AXIS ---
+                    fmt = '%d-%b %H:%M' if "minute" in interval else '%d-%b'
+                    df['date_str'] = df['date'].dt.strftime(fmt)
+
+                    # Plotting
+                    fig = go.Figure()
+                    fig.add_trace(go.Candlestick(x=df['date_str'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name="Price"))
+                    
+                    cols = {10:'cyan', 20:'magenta', 50:'orange', 100:'white'}
+                    for s, c in cols.items():
+                        fig.add_trace(go.Scatter(x=df['date_str'], y=df[f'EMA_{s}'], line=dict(color=c, width=1), name=f"E{s}"))
+                    fig.add_trace(go.Scatter(x=df['date_str'], y=df['VWAP'], line=dict(color='purple', width=2, dash='dot'), name="VWAP"))
+                    
+                    # Pivot Lines (xref="paper" ensures they span entire width)
+                    def add_line(val, col):
+                        fig.add_shape(type="line", x0=0, x1=1, xref="paper", y0=val, y1=val, line=dict(color=col, width=1, dash="dash"))
+                    
+                    pivots = [
+                        (p, "yellow"), (p+0.382*r, "green"), (p+0.618*r, "green"), (p+r, "lightgreen"),
+                        (p-0.382*r, "red"), (p-0.618*r, "red"), (p-r, "darkred")
+                    ]
+                    for val, col in pivots: add_line(val, col)
+
+                    fig.update_layout(
+                        height=500, margin=dict(l=10, r=10, t=10, b=10), template="plotly_dark", 
+                        xaxis_rangeslider_visible=False, xaxis_type='category', # CRITICAL FOR GAPS
+                        legend=dict(orientation="h", y=1.02)
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Stats
+                    cols = st.columns(7)
+                    cols[0].metric("P", f"{p:.2f}")
+                    cols[1].metric("R1", f"{p+0.382*r:.2f}"); cols[2].metric("R2", f"{p+0.618*r:.2f}"); cols[3].metric("R3", f"{p+r:.2f}")
+                    cols[4].metric("S1", f"{p-0.382*r:.2f}"); cols[5].metric("S2", f"{p-0.618*r:.2f}"); cols[6].metric("S3", f"{p-r:.2f}")
+                    st.divider()
+
+                for item in tokens_to_plot: generate_chart(item)
 
         except Exception as e: st.error(str(e))
 
@@ -294,19 +337,15 @@ def render_tradebook():
     if "editor_key" not in st.session_state: st.session_state.editor_key = 0
 
     if trigger:
-        # Save Trigger Inputs to Session so they persist during auto-refresh
-        st.session_state.tb_inputs = {
-            "file": uploaded_file, "symbol": root_symbol
-        }
-        # Run Calculation Once
+        # Save Inputs
+        st.session_state.tb_inputs = {"file": uploaded_file, "symbol": root_symbol}
         run_tradebook_calc()
 
-    # RENDER THE LIVE FRAGMENT (If data exists)
+    # RENDER LIVE FRAGMENT
     if st.session_state.tb_data:
         render_tradebook_live_fragment()
 
 def run_tradebook_calc():
-    """Heavy Calculation Logic (FIFO) - Runs only on Button Click"""
     try:
         inputs = st.session_state.tb_inputs
         uploaded_file = inputs["file"]
@@ -320,21 +359,22 @@ def run_tradebook_calc():
                 return t
             today_date = pd.Timestamp.now().normalize()
 
-            # Metadata (We only need static metadata here)
+            # 1. METADATA
+            eq_sym = get_correct_equity_symbol(root_symbol)
             inst_df = pd.DataFrame(kite.instruments("NFO"))
             inst_df['clean_sym'] = inst_df['tradingsymbol'].apply(clean_sym)
             stock_inst = inst_df[inst_df['name'] == root_symbol]
             
-            # Map Contracts
+            # Map
             contract_map = {}
             for _, r in stock_inst.iterrows():
                 contract_map[r['clean_sym']] = {
                     'token': int(r['instrument_token']), 'strike': float(r['strike']), 
                     'type': r['instrument_type'], 'lot_size': int(r['lot_size']),
-                    'expiry': r['expiry'] # Keep expiry for futures sort
+                    'expiry': r['expiry']
                 }
             
-            # Collect Trades
+            # 2. TRADES
             all_trades = []
             if uploaded_file:
                 uploaded_file.seek(0)
@@ -361,7 +401,7 @@ def run_tradebook_calc():
 
             if not all_trades: st.warning("No trades."); return
 
-            # FIFO
+            # 3. FIFO
             df_master = pd.DataFrame(all_trades)
             open_pos = []; ledger = {}
 
@@ -385,51 +425,41 @@ def run_tradebook_calc():
                     if item['qty'] > 0: item.update({'contract': cont, 'side': 'SHORT'}); open_pos.append(item)
                 ledger[cont] = cont_ledg
 
-            # Store Static Data
+            # Store
             st.session_state.tb_data = {
-                'df_open_static': pd.DataFrame(open_pos), # The list of open trades
+                'df_open_static': pd.DataFrame(open_pos),
                 'ledger': ledger,
                 'contract_map': contract_map,
                 'root_symbol': root_symbol,
-                'agg': pd.DataFrame() # Will build in live view
+                'agg': pd.DataFrame()
             }
             
     except Exception as e: st.error(str(e))
 
 @st.fragment(run_every=2)
 def render_tradebook_live_fragment():
-    # This fragment fetches LIVE PRICES for the OPEN POSITIONS calculated above
     data = st.session_state.tb_data
     if not data: return
     
     root_symbol = data['root_symbol']
     contract_map = data['contract_map']
-    df_op = data['df_open_static'].copy() # Work on a copy
+    df_op = data['df_open_static'].copy()
     
     try:
-        # 1. LIVE PRICES (Spot + Futures + Open Contracts)
+        # LIVE PRICES
         eq_sym = get_correct_equity_symbol(root_symbol)
         
-        # Identify Futures
         all_syms = list(contract_map.keys())
         fut_syms = [s for s in all_syms if contract_map[s]['type'] == 'FUT']
-        # Sort futures by expiry (we stored expiry in calc step)
         fut_syms.sort(key=lambda s: pd.to_datetime(contract_map[s].get('expiry', '2099-01-01')))
         top_3_futs = fut_syms[:3]
         
-        # Identify Open Position Tokens
-        op_tokens = []
-        if not df_op.empty:
-            op_tokens = [contract_map[s]['token'] for s in df_op['contract'].unique() if s in contract_map]
-            
-        # Get Future Tokens
+        op_tokens = [contract_map[s]['token'] for s in df_op['contract'].unique() if s in contract_map] if not df_op.empty else []
         fut_tokens = [contract_map[s]['token'] for s in top_3_futs]
         
-        # Bulk Fetch
         quote_keys = [eq_sym] + fut_tokens + op_tokens
-        quotes = kite.quote(list(set(quote_keys))) # unique
+        quotes = kite.quote(list(set(quote_keys))) 
         
-        # Helper Price Getter
         def get_price(token_or_sym):
             d = quotes.get(token_or_sym) or quotes.get(str(token_or_sym)) or quotes.get(int(token_or_sym) if str(token_or_sym).isdigit() else 0)
             if d:
@@ -437,20 +467,14 @@ def render_tradebook_live_fragment():
                 if d.get('ohlc', {}).get('close', 0) > 0: return d['ohlc']['close']
             return 0
 
-        # Metrics
         eq_ltp = get_price(eq_sym)
         fut_display = [(s, get_price(contract_map[s]['token'])) for s in top_3_futs]
         
-        # Update Open Positions with Live Prices
         if not df_op.empty:
             df_op['LTP'] = df_op['contract'].apply(lambda x: get_price(contract_map[x]['token']))
-            # If LTP 0, fallback to Spot (Theory)
             df_op['LTP'] = df_op.apply(lambda r: eq_ltp if r['LTP']==0 and contract_map[r['contract']]['type']=='FUT' else r['LTP'], axis=1)
-            
-            # P&L
             df_op['Unrealized'] = df_op.apply(lambda r: (r['LTP']-r['price'])*r['qty'] if r['side']=='LONG' else (r['price']-r['LTP'])*r['qty'], axis=1)
             
-            # Aggregation for Editor
             agg_rows = []
             grp = df_op.groupby(['contract', 'side'])
             for (cont, side), rows in grp:
@@ -462,18 +486,15 @@ def render_tradebook_live_fragment():
                 })
             st.session_state.tb_data['agg'] = pd.DataFrame(agg_rows)
         
-        # --- RENDER HEADER ---
-        # Live Dot
+        # DISPLAY
         st.markdown('<div><span class="live-dot"></span> <b>LIVE</b></div>', unsafe_allow_html=True)
         
-        # Row 1: P&L + Spot
         unrealized = df_op['Unrealized'].sum() if not df_op.empty else 0
         k1, k2, k3 = st.columns(3)
-        k1.metric("Realized (Fixed)", f"₹0") # Placeholder as Realized is static in FIFO
+        k1.metric("Realized (Fixed)", f"₹0")
         k2.metric("Floating P&L", f"₹{unrealized:,.0f}", delta=f"{unrealized:,.0f}")
         k3.metric("Spot", f"₹{eq_ltp}")
         
-        # Row 2: Futures
         if fut_display:
             f_cols = st.columns(len(fut_display))
             for i, (sym, p) in enumerate(fut_display):
@@ -481,7 +502,6 @@ def render_tradebook_live_fragment():
                 
         st.divider()
         
-        # --- RENDER LIST ---
         if not df_op.empty:
             st.markdown("### 🔓 Open Positions")
             v = df_op[['contract', 'side', 'time', 'qty', 'price', 'LTP', 'Unrealized']].copy()
@@ -490,9 +510,7 @@ def render_tradebook_live_fragment():
         
     except Exception as e: st.error(f"Live Error: {e}")
 
-    # --- RENDER EDITOR (Outside Exception to persist state) ---
-    # Note: Streamlit Editors don't play well inside fragments if they trigger reruns.
-    # We render the editor based on the 'agg' data we just calculated live.
+    # EDITOR (OUTSIDE FRAGMENT)
     if 'agg' in st.session_state.tb_data and not st.session_state.tb_data['agg'].empty:
         st.divider()
         c_head, c_btn = st.columns([4, 1])
@@ -536,6 +554,11 @@ def render_tradebook_live_fragment():
             
             if res:
                 st.dataframe(pd.DataFrame(res).style.format({'New Avg':'{:.2f}', 'Target':'{:.2f}', 'Proj P&L':'{:.0f}'}).background_gradient(subset=['Proj P&L'], cmap='RdYlGn'), use_container_width=True)
+
+        with st.expander("🕵️ Debug Ledger"):
+            if data['ledger']:
+                sel = st.selectbox("Contract", list(data['ledger'].keys()))
+                for l in data['ledger'][sel]: st.text(l)
 
 # --- 8. MAIN EXECUTION ---
 if app_mode == "Portfolio Manager": render_portfolio()
